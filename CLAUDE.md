@@ -1,0 +1,100 @@
+# NexoHHD — project context
+
+Sellable **handheld dynamometer**: ZELL TSA 300 kg load cell → CS1237 24-bit ADC (1280 Hz, PGA 128, external ref) → ESP32-WROOM-32 → force in Newtons streamed over BLE to a companion app. TP4056 charger, AP2112K-3.3 regulators behind a power latch, one WS2812B status LED. Layout mirrors the ErgoJump repo (`Current project/NexoHHD/` holds the sketch); firmware v0.1.0 was written 2026-09-03; it **compiles** (see Build) but is **not yet committed** and has **never run on hardware**.
+
+## Hardware (schematic "Sch celda de carga")
+
+| Function | GPIO | Notes |
+|---|---|---|
+| Power latch (AP2112 EN) | 25 | HIGH = stay on; asserted every loop pass |
+| Power button | 36 | input-only; **assumed active HIGH — unverified** |
+| Battery sense | 39 | ADC1, divider 220k/47k ≈ 5.68 |
+| Status LED (WS2812B) | 26 | |
+| LED strip (WS2812B) | 23 | unused so far; **count unconfirmed** |
+| USB detect (VBUS divider) | 34 | digital, HIGH = present |
+| CS1237 SCLK | 13 | |
+| CS1237 DOUT/DRDY | 14 | bidirectional during register ops |
+
+TP4056 CHRG/STDBY are **not** wired to the MCU → "charging" = "USB present".
+
+## CS1237 facts (bench-measured by the user)
+
+- Config register: write cmd 0x65 / read 0x56, 46-pulse sequence. Locked value **0x7C** = ext ref, 1280 Hz, PGA 128, ch A.
+- **Register is volatile: reverts to 0x0C (10 Hz) on supply dips the ESP32 survives.** A revert watchdog is mandatory (implemented in `Cs1237.cpp`: no sample for 50 ms → rewrite config, count + flag it).
+- After any config write: 2 ms settle + discard 4 conversions.
+- SCLK min pulse 455 ns; **never high >100 µs** (chip powers down). DOUT is sampled **while SCLK is high**. **Bit-bang timing margin matters under RF (2026-09-04):** at a 1 µs half-period, BLE streaming left the noise floor untouched (0.087 N in all radio states) but corrupted ~0.6 samples/s with single-bit read errors (sign bit → 2^23-count outliers of 3819 N; bits 10–13 → 1–3 N), and ~0.1/s while merely advertising; none with the radio off. On-time reads, no gaps. The bench sketch clocked ~3–4 µs/phase and never saw it. Half-period is now `CS1237_SCLK_HALF_US` = 2 µs and runtime-settable (`cs1237SetSclkHalfUs`, diag `CLK,<us>`). **A/B result (2026-09-04, streaming to nRF Connect, ~40 pkt/s): 1 µs → 53 spikes/min; 2 µs → 2 spikes in 84 s (37× fewer, not zero).** Margin is the lever, so the mechanism is almost certainly **RF TX current pulses sagging the CS1237 digital supply / shifting logic thresholds** — the same root cause as the known config-register revert on supply dips. Firmware can widen the margin (try 3–4 µs; 4 µs = 216 µs/read = 28% ISR duty, still fine) but the fix belongs on the PCB respin: check which AP2112 feeds CS1237 DVDD, add an RC filter (≈10 Ω + 10 µF) on DVDD, scope 3V3 during TX. **Production to-do**: corrupted samples must be *flagged in the data contract*, not silently passed — a spike detector like the diag's, with a flag bit in the packet header (and/or NaN for the sample), is the honest option; a sign-bit flip alone puts 3800 N into a force curve.
+- Effective rate is **above nominal and varies per chip** (internal oscillator): +0.57% (1287 SPS) on the bench module, **+2.05% (1306.3 SPS, 765–766 µs) on production PCB unit #1** (measured 2026-09-03) → every sample carries its own 64-bit `esp_timer_get_time()` timestamp from the DRDY ISR; never assume the nominal interval, never use `micros()`. The ESP32 timebase is crystal-derived (~10 ppm) so it is the trustworthy reference here.
+  **App-facing consequence (hand to the app team with the protocol spec).** An app that counts samples and assumes 1280 Hz gets, on this unit: **RFD 2% low, impulse 2% high, time-to-peak 2% long**. It does not average away, it differs per unit (1287 vs 1306 SPS = 1.5% disagreement between two calibrated units), and no force calibration can fix it. The app must derive dt from the header timestamps (interpolating within a packet is fine, the error over 32 samples is ~0.1%). **Trap: the header timestamp is the low 32 bits of a µs clock, so it wraps every 71.6 min** — the app must handle the wrap.
+- PGA 128 puts 300 kg at 77% of full scale (excitation-independent, REFIN tied to excitation). Noise at 1280 Hz: 0.096 N RMS on the bench protoboard; **0.027 N RMS (59 counts), 0.16 N pk-pk on PCB unit #1** (2026-09-03, clean 1 s windows). Nominal scale ≈ 4.553e-4 N/count — this agrees to 0.03% with the bench sketch's empirical `COUNTS_PER_N = 2197.0` (4.5517e-4) and `COUNTS_PER_KG = 21542` (nominal 21547), so the Config.h default is already cross-validated and a 1 kg reference should read 9.81 N without any calibration.
+- **Zero drift during warm-up**: PCB unit #1 moved ≈ +4300 counts (≈ +2 N) between two tares ~6 min apart from cold; ~-0.06 N over a 30 s MEAS once warm. Tare at the start of every session (the app's `TARE`), and keep the calibration procedure's warm-up step.
+- Locked: **always sample at 1280 Hz, decimate per SKU** (runtime `DEC,<n>` command).
+
+### Accuracy budget (basis for any spec sheet claim)
+
+Per single sample, at the measured 0.086 N RMS:
+
+| Term | Size | Behaviour |
+|---|---|---|
+| ADC + front-end noise | 0.086 N RMS, ~0.26 N at 3σ | random per sample, **averages away** (0.015 N over a 32-sample packet) |
+| Cell combined error (non-lin + hysteresis + repeatability) | **0.59 N** (±60 g @ 300 kg TSA); 0.39 N on the 200 kg production cell | systematic for a given load/history, **does not average away** |
+| Zero drift since `TARE` | 0.1–0.2 N/min after handling, decaying; ~2 N over 6 min from cold | removed by taring in position; re-tare per session |
+| **Calibration span error** | **proportional to the reading**: 1% cal error = 5 N at 500 N | the only term that breaks the 1 N budget |
+
+Noise and cell error combine to **≈ 0.60 N**, cell-dominated ~7:1, so a single sample is comfortably inside 1 N. **The budget is lost only through span error or an un-taren drift**, never through the electronics. Note the cell term is largely *systematic*: it cancels in left/right asymmetry ratios and in session-over-session tracking, which is what HHD users actually care about, so repeatability is far better than absolute accuracy suggests.
+
+## Firmware architecture (Current project/NexoHHD/)
+
+- `Cs1237.cpp/h` — DRDY ISR timestamps + reads 24 bits (per-bit critical sections bound SCLK-high), pushes into a 512-sample ring (overflow drops oldest + counts). Register ops with readback verification. Revert watchdog in `cs1237Service()`. DOUT idles as `INPUT_PULLUP` (matches the bench sketch). `cs1237ReadConfig()` = on-demand, bounded config readback for diagnostics only (detaches DRDY for one op). **DRDY interrupt is LOW-LEVEL triggered (`ONLOW`), not falling-edge** — first hardware run (2026-09-03) showed polling working perfectly while a FALLING ISR never delivered a sample (DRDY is a level that stays low until read: one missed edge = permanent stall). Guards: in-ISR storm cut when DOUT stays low after the reset pulses (`CS1237_STORM_LIMIT`), rate-limited recovery; loop-side fallback read when DOUT has been low > `CS1237_MISSED_DRDY_US` with no ISR sample (counted, reported). STATUS carries `IRQ/SPUR/MISS/STORM`: healthy = IRQ ≈ samples, others 0.
+- `ForceSensor.cpp/h` — raw → N; per-unit calibration in NVS (`nexo` namespace: `caloff`, `calscale`); commands `CAL0`, `CALW,<N>`, runtime `TARE`. Prints "unit NOT calibrated" until the procedure is run.
+- `BleService.cpp/h` — data (notify) / control (write) / status chars; MTU up to 517. **onWrite only enqueues; commands execute on the loop task.** Advertising restart deferred, no delay() in callbacks.
+- `BatteryMonitor.cpp/h` — non-blocking (1 ADC sample/pass, 32-sample averages); safety cutoff at 3.25 V (armed 3 s, 5 consecutive lows), **never deferred during streaming**.
+- `PowerManager.cpp/h` — pre-setup() constructor latches power; brown-out detector disabled **only during boot** and restored at end of setup(). Long-press off (800 ms) with red-LED feedback; inactivity auto-off 10 min, cheap-check-first.
+- `LedController.cpp/h` — blue idle / cyan connected / amber breathing on USB / red blink low battery / override.
+- `NexoHHD.ino` — pipeline: drain ring → calibrate → decimate → 32-sample packets (40 pkt/s); loop-stall watchdog (`LOOP=` in STATUS); serial + BLE share `processCommand`.
+
+BLE packet v1 (**PROVISIONAL — app team has not confirmed their format**): 12-byte LE header (version, flags[revert/drops/raw], u16 seq, u32 first-sample µs, u16 dropped saturating, u8 count) + count×float32. Full spec + calibration procedure in `README.md`.
+
+## Build & diagnostics
+
+- **arduino-cli is bundled with the Arduino IDE** (nothing to install): `%LOCALAPPDATA%\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe` (1.4.1), ESP32 core 3.3.8, `Adafruit NeoPixel` 1.15.4 and `NimBLE-Arduino` 2.5.0 in `OneDrive\Documents\Arduino\libraries`. **Compile-check every change**: `arduino-cli.exe compile --fqbn esp32:esp32:esp32 --warnings all --build-path <scratch dir> "<sketch dir>"`.
+- 2026-09-03: main sketch and SignalChainTest both compile warning-free. **Main firmware is 1,134,952 B = 86% of a 1.25 MB OTA slot** (Bluedroid BLE stack). Adding OTA on "Default 4MB with spiffs" will not fit for long — plan on NimBLE (typically saves ~400–500 KB) or a custom partition table before OTA work starts.
+- `Diagnostics/SignalChainTest/` — standalone bring-up sketch (2026-09-03): signal chain + ErgoJump-style latch/button/auto-off + blue status LED, **no BLE, no battery monitor**. `Config.h`, `Cs1237.*`, `PowerManager.*`, `LedController.*` are **verbatim copies** of the main sketch so it tests the shipped driver — re-copy after any edit to those files (its README has the diff command). Streams one line per averaging window (default 1000 ms = 1 line/s over ~1287 samples; `WIN,25` = the 40 lines/s 32-sample pack view) in the format of the user's old bench sketch (SPS, N, RMS N, pk-pk N, raw mean, n, max gap, loop gap, `!DROP/!RECFG/!MISS/!STORM/!BAD/!RATE/!GAP` markers), all from ISR timestamps; `MEAS[,<s>]` ports the bench sketch's `=== BEGIN RESULT ===` block (config on chip, eff rate, max gap, drops, reverts, mean, tared, RMS, pk-pk, drift). Other commands: `STREAM,0|1` / `CFG` / `TARE` / `DUMP,<n>` / `STATUS` / `CLR` / `OFF`. **BLE on demand** (`BLE,1`; `BleService.*` verbatim copy; sends real protocol-v1 packets while a central is connected, `TX,0|1`) for the radio-off / advertising / streaming noise A/B — the line and the MEAS block carry the radio state label. Pass criteria in its README.
+
+## Ground rules (from the ErgoJump post-mortem — do not regress)
+
+ErgoJump history (repo `..\ErgoJump`, commit `c47a941` "fix picos"): a ~110 ms blocking battery read stalled the loop and swallowed plate contacts, merging two flights into one spike; the blocking read had been *introduced by an accuracy improvement* two commits earlier and nothing caught it. Its fix (`isTestRunning()` deferral) does **not** transfer here — a streaming device has no idle window. Hence:
+
+1. **No `delay()` on any steady-state path.** Housekeeping = state machines. Nothing is "paused during measurement" because nothing blocks.
+2. **Timestamp in the ISR, decide in the loop.** 64-bit esp_timer only.
+3. **Queue every sample; never keep just the latest** (a one-slot snapshot loses A→B→A pairs).
+4. **Diagnostics are part of the data contract**: dropped samples, revert recoveries, max sample gap, max loop gap — reported over BLE, not debug-only.
+5. **Commands run on the loop task only** (ErgoJump ran test logic on the BLE stack task, unsynchronized).
+6. **Fail loudly on bad input** (ErgoJump silently hung on out-of-range sensitivity).
+7. **Bounded waits everywhere** (ErgoJump's setup could hang forever on a stuck button).
+8. **Per-unit tunables live in NVS via a procedure**, never hand-edited into Config.h (ErgoJump's USB window was re-tuned 4× into meaninglessness; battery ratio 3×).
+9. Real random BLE UUIDs, no shipped debug flags, comments must not contradict values.
+
+## Planned: OTA firmware updates
+
+Wanted for this project **and** ErgoJump (not implemented yet — treat as a constraint on new work). Implications:
+
+- **Partition scheme must be decided before units ship — irreversible.** OTA needs two app partitions + otadata. Arduino's "Default 4MB with spiffs" on a 4 MB WROOM-32 already gives two ~1.25 MB OTA slots (so app size caps at ~1.25 MB); a single-app scheme like "Huge APP" makes OTA **impossible**, and changing the table on a fielded unit needs a wired reflash. Confirm actual flash size before locking it in.
+- **WiFi OTA is viable here** — battery sense is GPIO39 (ADC1_CH3), GPIO34/36 are digital, and CS1237 pins 13/14 are used as plain digital GPIO, so the WiFi/ADC2 restriction does not bite. (It *does* break ErgoJump, whose USB detect is an `analogRead` on GPIO13 = ADC2_CH4.) BLE OTA needs no provisioning UX but takes minutes at BLE throughput.
+- **Calibration must survive updates.** `caloff`/`calscale` live in NVS, which OTA preserves — but renaming keys or changing layout would orphan per-unit calibration and make the device silently report wrong forces. Add an **NVS schema version key + migration** before the first OTA ships.
+- **Guard the update**: enable bootloader rollback (`esp_ota_mark_app_valid_cancel_rollback()` after a self-test), and refuse to start an OTA while streaming or when the battery is low. Note the brown-out detector is already restored after boot here, which matters because flash writes during a sag corrupt.
+- `FW_VERSION` is already reported in the BLE STATUS string, which the app needs to decide whether to offer an update. Sign images for a sellable product.
+
+## Open items
+
+1. **Verify button polarity on GPIO36** (active-HIGH is an assumption). SignalChainTest logs the raw pin level at boot and on every change; its README describes the inverted-polarity symptom (red LED ~1 s after boot, first press powers off). 2026-09-03: released reads LOW (`BTN 0`) and the unit stays on, consistent with active-HIGH; a logged press → HIGH would close this.
+1b. ~~USB detect read 0 during the first serial session~~ — resolved 2026-09-04: the board is a bare ESP32 module flashed and monitored through an **external USB-UART adapter**, nothing on the USB-C port, so `USB 0` is correct. Bench sessions therefore run on battery with the inactivity auto-off armed (10 min, any serial command resets it). VBUS detect on GPIO34 still untested: plug USB-C in once and check `USB 1`.
+2. **Cross-check of the 46-pulse register-op boundaries — done 2026-09-03.** Grouping 24+3+2+7+1+8+1 matches the bench sketch `Downloads\cs1237_bringup\cs1237_bringup.ino` (`cs1237_xfer()`); the remaining differences (direction-switch timing, pull-up) are documented in the `Cs1237.cpp` header. Hardware confirmation still pending: `CFG` → 0x7C and ~1287 SPS in SignalChainTest.
+3. **Compile — done** (see Build & diagnostics). **First hardware run 2026-09-03 (main sketch)**: LED blue, latch/button OK, CS1237 register path OK (readback 0x7C, polled conversions), but the falling-edge DRDY ISR delivered nothing → revert watchdog fired ~17×/s. Driver switched to level-triggered DRDY + storm guard + loop-side fallback + `IRQ/SPUR/MISS/STORM` diagnostics. **Re-flashed with SignalChainTest the same day: level-triggered DRDY works** (irq == samples, storm 0, 1306 SPS, clean windows 0.027 N RMS). That run exposed a second bug, fixed the same day: the loop-side fallback and the watchdog captured `now` *before* reading `lastSampleUs`; when the ISR landed in between the unsigned subtraction wrapped → phantom fallback reads (~1.2/s, garbage value, timestamp a few µs in the past, huge pk-pk) and spurious reconfigures every ~20 s. Rule now in the driver: **read `lastSampleUs` before the clock, always.** **Verified 2026-09-04**: 11 consecutive 1 s windows with no markers, gap 768–774 µs, loop 433–547 µs, 1305.7 SPS, n 1306. Noise in that session: **0.083–0.091 N RMS, 0.52–0.64 N pk-pk** (≈ bench 0.096 N).
+
+**Noise A/B, 2026-09-04** (3 mechanical conditions, ~10 windows each, re-tared per condition): RMS **0.082–0.091 N** and pk-pk **0.48–0.68 N** in *all three*, pk-pk/RMS ≈ 6.1 (clean Gaussian). Mechanical condition does **not** move the noise floor → **take 0.086 N RMS as the working figure** (0.096 N bench, so the PCB is at spec). After the 32-sample packet average this is ≈ 0.015 N. The 0.027 N RMS windows from the first session were never reproduced and are *not* mechanical; if the number matters, the remaining suspect is the analog supply/ground path (battery vs adapter-powered), not the firmware. Raw mean shifted ~7450 counts (≈ 3.4 N) between conditions, sign included, confirming the cell responds to orientation as expected. Post-handling settling ≈ 0.1–0.2 N/min in either direction, decaying → **tare only after the unit is in its final position**.
+3b. **Known-weight scale check — not yet done** (user has no calibration weights). Does not need any: **1 L of water = 1 kg = 9.81 N to better than 1%**, and the nominal scale predicts 21547 counts/kg. Tare in position, hang the bottle, expect 9.8 N. This validates the whole chain end to end and is the last unverified link.
+4. **BLE format**: confirm with the app team, then freeze protocol v1 (bump version on any layout change).
+5. LED strip count on GPIO23 unconfirmed; strip currently unused.
+6. **Initial git commit still pending** (user makes the call).
+7. **Choose the OTA partition scheme before the first units ship** (see above) — the only item on this list that cannot be fixed remotely later. The main app is already 86% of a default OTA slot (see Build), so this decision is coupled to the BLE stack choice (Bluedroid vs NimBLE).
+8. ErgoJump itself still carries live bugs found during the review (32-bit `micros()` wrap in TS-mode at JumpTests.cpp:708/722; sensitivity 1201–2000 ms silently prevents any jump validating; `plateEdgesDropped` never read) — fix there if that product is still maintained.

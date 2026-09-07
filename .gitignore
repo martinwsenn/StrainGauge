@@ -1,0 +1,18 @@
+# Arduino / arduino-cli build output
+build/
+*.bin
+*.elf
+*.hex
+*.map
+*.partitions.bin
+*.bootloader.bin
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# OS / OneDrive junk
+Thumbs.db
+desktop.ini
+.DS_Store
