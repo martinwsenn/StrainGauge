@@ -55,11 +55,17 @@
 // row = line stuck low; the ISR cuts its own interrupt so a level trigger
 // cannot starve the loop, and the service loop recovers.
 #define CS1237_STORM_LIMIT 4
-// SCLK half-period (high = low), us. Datasheet minimum is 0.455 us. At 1 us
-// the first BLE test showed rare single-bit read errors (sign bit, bits
-// 10-13) only while the radio was active; the bench sketch's ~3-4 us never
-// did. 2 us = 108 us per 27-pulse read, 14% of the 765 us interval.
-#define CS1237_SCLK_HALF_US 2
+// SCLK half-period (high = low), us. Datasheet minimum is 0.455 us. Under BLE
+// streaming the read gets corrupted when the radio transmits (2026-09-04/08,
+// unit #1): at 1 us ~52 corrupted samples per minute, half single flipped
+// bits (sign bit = 3819 N, bit 11 = 1 N), half multi-bit bursts; at 2 us
+// 1 in ~18 min; at 3-4 us none seen in 12 min. The bench sketch's ~3-4 us
+// never saw one. 3 us = 162 us per 27-pulse read, 21% of the 765 us
+// interval, no measurable effect on the loop. All of that was measured with
+// the PCB fed 3.3 V into the battery node (regulators in dropout, no supply
+// headroom during TX bursts): re-measure on a pack before blaming the board.
+// See CLAUDE.md.
+#define CS1237_SCLK_HALF_US 3
 #define CS1237_SETTLE_MS 2            // analog settling after config write
 #define CS1237_DISCARD_AFTER_CONFIG 4 // conversions discarded after write
 
