@@ -175,21 +175,94 @@ RF bursts, not ADC noise.
 A **spike** is a lone sample more than 1500 counts (0.68 N, about 8 sigma)
 away from both neighbours while the neighbours agree with each other. No real
 force does that inside one sample at 1306 Hz, so every spike is a corrupted
-read. Each one prints a `SPIKE` line with the previous, offending and next
-raw values in hex and the XOR against the previous sample, so the flipped
-bit is named outright:
+read, a glitch on the DOUT pin, or a very short mechanical impulse. Each one
+prints a `SPIKE` line with uptime, radio state and SCLK setting, the
+previous / offending / next raw values in hex, and a classification:
 
 ```
-SPIKE #3: prev 0xFFF59C mid 0x7FF59C next 0xFFF5A0 (+8388608 cts, +3819.44 N) -> single bit 23
+SPIKE #3 @412s ble=stream clk=1us: prev 0xFFF59C mid 0x7FF5A1 next 0xFFF5A0 (+8388613 cts, +3819.44 N) -> bit 23 (jump +8388613 = +2^23 +5)
+SPIKE #4 @413s ble=stream clk=1us: prev 0x0012AB mid 0x001AC0 next 0x0012B9 (+2069 cts, +0.94 N) -> bit 11 (jump +2069 = +2^11 +21)
+SPIKE #5 @980s ble=off clk=2us:    prev 0xFFF8C0 mid 0xFFFFFF next 0xFFF8B2 (+1855 cts, +0.84 N) -> all-ones read (DOUT not driven)
+SPIKE #6 @981s ble=off clk=2us:    prev 0xFFF8C0 mid 0xFFE100 next 0xFFF8B2 (-6080 cts, -2.77 N) -> no bit pattern (xor 0x0019C0)
 ```
 
-Lines carry `!SPIKE` and `STATUS` counts them (`spikes`). `CLK,<us>` sets the
-SCLK half-period at runtime (default now 2 µs; the first BLE run used 1 µs).
-To A/B: with nRF Connect connected and `pkt` at ~41, `CLR`, `CLK,1`, wait a
-minute, `STATUS`; then `CLR`, `CLK,2`, a minute, `STATUS`. If spikes vanish at
-2 µs the margin theory holds and the default stays. If they persist, the
-coupling is on the board (SCLK/DOUT routing or the CS1237 digital supply
-during TX bursts) and the next step is hardware, not firmware.
+- **bit k**: the jump from both neighbours is 2^k within noise (±700 counts).
+  A single flipped bit in the read: bit 23 is the sign (3819 N), bits 11–13
+  are 1–4 N. This is the RF timing-margin signature.
+- **all-ones read**: the sample was 0xFFFFFF. DOUT was never driven low
+  during the read, so the ISR entered on something other than DRDY (a glitch
+  on the pin, e.g. while handling the bare board).
+- **no bit pattern**: anything else — a mechanical tap, multi-bit corruption.
+
+Lines carry `!SPIKE`; `STATUS` shows `spikes N (bit-like B, all-ones A)`, so
+the classification survives even if the `SPIKE` lines scroll away. `CLR`
+resets all three. `CLK,<us>` sets the SCLK half-period at runtime (default
+3 µs since 2026-09-08; 2 µs before that, the first BLE run used 1 µs).
+
+**A/B procedure.** `WIN,10000` (one line per 10 s keeps the log short).
+Radio off: `CLR`, 3 min, `STATUS` (expect 0). `BLE,1`, connect, subscribe to
+`0002` (the firmware only transmits packets to a subscribed central; without
+it the radio is nearly idle and the test proves nothing). Then per setting:
+`CLR`, `CLK,n`, 5 min untouched, `STATUS`, keep every `SPIKE` line.
+
+**Results (unit #1):**
+
+| Date | Condition | Half-period | Duration | Spikes |
+|---|---|---|---|---|
+| 2026-09-04 | stream | 1 µs | ~60 s | 53 |
+| 2026-09-04 | stream | 2 µs | 84 s | 2 (bits unknown, lines lost) |
+| 2026-09-08 | off | 2 µs | 251 s | 0 |
+| 2026-09-08 | stream | 2 µs | 594 s | 0 |
+| 2026-09-08 | stream | 3 µs | 369 s | 0 |
+| 2026-09-08 | stream | 4 µs | 353 s | 0 |
+| 2026-09-08 (2nd) | off, boot + placing + TARE | 2 µs | 106 s | 0 |
+| 2026-09-08 (2nd) | stream, positive control | 1 µs | 60 s | 52 (24 single-bit, 28 multi-bit) |
+| 2026-09-08 (2nd) | stream | 2 µs | 489 s | 1 (multi-bit) |
+
+The positive control reproduced the first session (52 vs 53 per minute at
+1 µs), so the radio load in these runs is real and comparable. Pooled: 2 µs
+= 1 corrupted sample in ~18 min of streaming; 3–4 µs = 0 in 12 min. **The
+default is now 3 µs** (`CS1237_SCLK_HALF_US`): a 400× reduction from 1 to
+2 µs says margin is the lever, and 3 µs costs nothing measurable (21% ISR
+duty, loop gap unchanged). Keep testing at the shipped setting so the
+evidence accumulates where it matters.
+
+What the classified lines showed at 1 µs: single-bit errors were bit 11
+(≈1 N) and bit 23 (the sign, 3819 N); the multi-bit ones included the same
+corrupted word twice in separate events (`mid 0xFFE01F`: bits 12–5 read 0,
+bits 4–0 read 1, regardless of the true bits). Data-independent runs like
+that mean DOUT itself was not presenting data for ~13 bit times: the
+CS1237 output stage is being starved during the TX burst, which slows its
+edges past the sample point. Slower clocks tolerate slower edges, hence the
+trend. A scope on DOUT and the CS1237 supply pin during a BLE burst at
+`CLK,1` would show it directly (respin input).
+
+The 16 pre-baseline spikes from the first 2026-09-08 session did not
+reproduce (0 through boot, placing and taring in the second session), so
+they are attributed to handling the bare board; the all-ones class in the
+detector will catch a recurrence.
+
+**Noise in 10 s windows** is not comparable with the 1 s figures: RMS reads
+0.094–0.104 N radio-off (drift inside the longer window adds to it). In the
+first 2026-09-08 session it crept from ~0.100 to ~0.118 N over 30 min on
+battery; in the second (12 min) it stayed at 0.093–0.112 N and `MEAS,30`
+under streaming at 2 µs gave **0.0962 N RMS, 1.12 N pk-pk, drift −0.01 N**.
+Cause of the earlier creep unknown, so `STATUS` prints the pack voltage
+(`bat`).
+
+**`bat` read 3.23–3.28 V throughout the second session.** That is not a
+pack: on the bench the PCB is powered from an ESP32 devkit's 3.3 V rail into
+the battery node (the devkit is also the USB-UART bridge), and the reading
+is that rail within ~0.05 V, so the divider and ADC path are roughly right.
+It also means **both AP2112 regulators are in dropout during every bench
+run** (3.3 V in, 3.3 V out): nothing rejects the ESP32's TX current pulses
+before they reach the CS1237's supply. That is the worst possible case for
+the read-corruption finding above. **All spike counts in the table were
+taken in that condition.** The next run must be on a charged pack, with the
+devkit wired for GND/TX/RX only: repeat the 1 µs positive control (52/min
+on the devkit rail) and a 10 min run at the shipped 3 µs. If the pack run
+is clean even at 1 µs, the corruption is a bench artefact; if it persists,
+the CS1237 supply filtering goes on the respin as planned.
 
 ### Open items this sketch settles
 
@@ -211,17 +284,17 @@ during TX bursts) and the next step is hardware, not firmware.
 | Command | Effect |
 |---|---|
 | `HELP` | list commands |
-| `STATUS` | lifetime counters, tare, stream/meas state, pin map |
+| `STATUS` | lifetime counters, spike classes, tare, radio state, pack voltage, pin map |
 | `STREAM,0` / `STREAM,1` | pause / resume the stream (handy while reading a result block) |
 | `WIN,<ms>` | averaging window per line, 25..10000 ms (default 1000; 25 = 40 lines/s) |
 | `BLE,1` | start the radio and advertise (production BLE module); reset to stop |
 | `TX,0` / `TX,1` | send protocol-v1 data packets while connected (default on) |
-| `CLK,<us>` | SCLK half-period 1..10 µs (default 2); timing-margin A/B under radio load |
+| `CLK,<us>` | SCLK half-period 1..10 µs (default 3); timing-margin A/B under radio load |
 | `MEAS` / `MEAS,<s>` | measurement run of s seconds (default 10, max 600); reads the chip config first, prints the result block at the end |
 | `CFG` | read back the config register (detaches DRDY for one bounded op; expect one ~2-interval gap) |
 | `TARE` | average the next 256 samples as zero; `N` then shows `tared` |
 | `DUMP,<n>` | next n raw samples (1..256) as CSV, stream paused meanwhile |
-| `CLR` | reset sketch-side maxima (burst, loop gap, bad count) |
+| `CLR` | reset sketch-side maxima and counts (burst, loop gap, bad reads, spikes) |
 | `OFF` | release the latch |
 
 Any command counts as user activity for the auto-off timer.

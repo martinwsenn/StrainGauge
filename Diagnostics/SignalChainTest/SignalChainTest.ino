@@ -42,7 +42,7 @@
 #include <string.h>
 #include "esp_timer.h"
 
-#define DIAG_VERSION "0.4.0"
+#define DIAG_VERSION "0.4.1"
 #define SERIAL_BAUD 115200
 // Stream and DUMP lines are written from the sample pipeline. A large TX
 // buffer keeps Serial.print from ever blocking the loop: even the fastest
@@ -187,16 +187,36 @@ static uint32_t orderErrors = 0; // timestamp went backwards: a driver bug, neve
 // ---- Spike detector: a lone sample that disagrees with BOTH neighbours by
 // more than SPIKE_TH_COUNTS while the neighbours agree with each other. The
 // cell's mechanical bandwidth is far below 1306 Hz, so no real force does
-// that inside one sample: it is a corrupted read. Each one is logged with
-// the XOR against the previous sample so the flipped bit is visible. The
-// first BLE run produced these only while the radio was active (sign bit
-// and bits 10-13), at SCLK half-period 1 us.
+// that inside one sample: it is a corrupted read, a pin glitch, or a very
+// short mechanical impulse. Each one is classified and logged:
+//   bit k     the jump mid-prev is 2^k within noise: a single flipped bit
+//             (bit 23 = sign = 3819 N; bits 11-13 = 1-4 N). Only bits >= 11
+//             clear SPIKE_TH_COUNTS. The first BLE run produced these only
+//             while the radio was active, at SCLK half-period 1 us.
+//   all-ones  the sample read 0xFFFFFF: DOUT was not driven low during the
+//             read (ISR entered on a glitch, not on DRDY).
+//   no bit pattern  anything else (mechanical tap, multi-bit corruption).
+// The bit-like count is kept separately so the classification survives a
+// lost scrollback, and the line carries uptime / radio state / SCLK setting.
 #define SPIKE_TH_COUNTS 1500L // ~0.68 N, ~8 sigma of the 190-count noise
+#define SPIKE_BIT_TOL_COUNTS 700L // +/- band around 2^k, ~3.7 sigma of the noise
 #define SPIKE_LOG_PER_S 4
 static int32_t spikeA = 0, spikeB = 0;
 static uint8_t spikeFill = 0;
-static uint32_t spikes = 0, spikesWindow = 0;
+static uint32_t spikes = 0, spikesWindow = 0, spikesBitLike = 0, spikesAllOnes = 0;
 static uint32_t spikeLogCount = 0, spikeLogSecond = 0;
+static const char *bleLabel();
+
+// Returns k if |delta| is within SPIKE_BIT_TOL_COUNTS of 2^k (k = 11..23),
+// else -1. A bit-23 flip moves the sign-extended value by exactly 2^23.
+static int spikeBitOf(long delta) {
+  const long m = labs(delta);
+  for (int k = 11; k <= 23; k++) {
+    const long p = 1L << k;
+    if (m >= p - SPIKE_BIT_TOL_COUNTS && m <= p + SPIKE_BIT_TOL_COUNTS) return k;
+  }
+  return -1;
+}
 
 static void detectSpike(int32_t c) {
   if (spikeFill >= 2) {
@@ -205,20 +225,29 @@ static void detectSpike(int32_t c) {
     if (labs(da) > SPIKE_TH_COUNTS && labs(dc) > SPIKE_TH_COUNTS && labs(dac) <= SPIKE_TH_COUNTS) {
       spikes++;
       spikesWindow++;
+      char kind[48];
+      const int k = spikeBitOf(da);
+      if (b == -1) {
+        spikesAllOnes++;
+        snprintf(kind, sizeof(kind), "all-ones read (DOUT not driven)");
+      } else if (k >= 0 && k == spikeBitOf(dc)) {
+        spikesBitLike++;
+        snprintf(kind, sizeof(kind), "bit %d (jump %+ld = %s2^%d %+ld)", k, da, da < 0 ? "-" : "+", k,
+                 labs(da) - (1L << k));
+      } else {
+        snprintf(kind, sizeof(kind), "no bit pattern (xor 0x%06lX)",
+                 (unsigned long)(((uint32_t)b ^ (uint32_t)a) & 0xFFFFFFUL));
+      }
       const uint32_t sec = uptimeS();
       if (sec != spikeLogSecond) {
         spikeLogSecond = sec;
         spikeLogCount = 0;
       }
       if (spikeLogCount++ < SPIKE_LOG_PER_S) {
-        const uint32_t x = ((uint32_t)b ^ (uint32_t)a) & 0xFFFFFFUL;
-        char bitInfo[32];
-        if (x != 0 && (x & (x - 1)) == 0) snprintf(bitInfo, sizeof(bitInfo), "single bit %d", __builtin_ctz(x));
-        else snprintf(bitInfo, sizeof(bitInfo), "xor 0x%06lX", (unsigned long)x);
-        Serial.printf("SPIKE #%lu: prev 0x%06lX mid 0x%06lX next 0x%06lX (%+ld cts, %+.2f N) -> %s\n",
-                      (unsigned long)spikes, (unsigned long)((uint32_t)a & 0xFFFFFFUL),
-                      (unsigned long)((uint32_t)b & 0xFFFFFFUL), (unsigned long)((uint32_t)c & 0xFFFFFFUL),
-                      da, toNewtons((double)da), bitInfo);
+        Serial.printf("SPIKE #%lu @%lus ble=%s clk=%luus: prev 0x%06lX mid 0x%06lX next 0x%06lX (%+ld cts, %+.2f N) -> %s\n",
+                      (unsigned long)spikes, (unsigned long)sec, bleLabel(), (unsigned long)cs1237SclkHalfUs(),
+                      (unsigned long)((uint32_t)a & 0xFFFFFFUL), (unsigned long)((uint32_t)b & 0xFFFFFFUL),
+                      (unsigned long)((uint32_t)c & 0xFFFFFFUL), da, toNewtons((double)da), kind);
       }
     }
   }
@@ -463,23 +492,32 @@ static void handleSample(const Cs1237Sample &s) {
 
 // ---- Reporting / commands ----
 
+// Battery pack voltage, one blocking ADC1 read (~100 us) only when STATUS is
+// typed: the diag has no battery monitor, and the noise floor drifted upward
+// over a 30 min battery-powered session (2026-09-08) with no way to tell
+// whether the pack was sagging. Nominal divider, uncalibrated.
+static float batteryVoltsOneShot() {
+  return (float)analogReadMilliVolts(BATTERY_PIN) * BATTERY_DIVIDER_RATIO / 1000.0f;
+}
+
 static void printStatus() {
   Serial.printf("STATUS: diag v%s | uptime %lu s | ADC running %d | stream %d win %lu ms | meas %d | lines %lu | "
                 "samples %lu | drop %lu | recfg %lu | maxgap %lu us | maxburst %lu | maxloop %lu us | "
-                "bad %lu order %lu spikes %lu | irq %lu spurious %lu miss %lu storm %lu | clk %lu us | "
-                "ble %s pkts %lu | tare %ld (%s) | BTN %d USB %d | pins LATCH %d BTN %d USB %d LED %d SCLK %d DOUT %d\n",
+                "bad %lu order %lu spikes %lu (bit-like %lu, all-ones %lu) | irq %lu spurious %lu miss %lu storm %lu | clk %lu us | "
+                "ble %s pkts %lu | tare %ld (%s) | BTN %d USB %d bat %.2f V | pins LATCH %d BTN %d USB %d LED %d SCLK %d DOUT %d\n",
                 DIAG_VERSION, (unsigned long)uptimeS(), cs1237IsRunning() ? 1 : 0, streamOn ? 1 : 0,
                 (unsigned long)(windowUs / 1000ULL), meas.active ? 1 : 0, (unsigned long)packSeq,
                 (unsigned long)lifetimeSamples,
                 (unsigned long)cs1237DroppedCount(), (unsigned long)cs1237ReconfigCount(),
                 (unsigned long)cs1237MaxGapUs(), (unsigned long)maxBurst, (unsigned long)maxLoopGapUs,
                 (unsigned long)lifetimeBad, (unsigned long)orderErrors, (unsigned long)spikes,
+                (unsigned long)spikesBitLike, (unsigned long)spikesAllOnes,
                 (unsigned long)cs1237IsrCalls(), (unsigned long)cs1237IsrSpurious(),
                 (unsigned long)cs1237EdgeMissCount(), (unsigned long)cs1237StormCount(),
                 (unsigned long)cs1237SclkHalfUs(),
                 bleLabel(), (unsigned long)packetsSent,
                 (long)tareCounts, tareValid ? "valid" : "not set",
-                digitalRead(POWER_BUTTON_PIN), isUsbPresent() ? 1 : 0,
+                digitalRead(POWER_BUTTON_PIN), isUsbPresent() ? 1 : 0, batteryVoltsOneShot(),
                 POWER_LATCH_PIN, POWER_BUTTON_PIN, USB_DETECT_PIN, STATUS_LED_PIN,
                 CS1237_SCLK_PIN, CS1237_DATA_PIN);
 }
@@ -501,7 +539,7 @@ static void printHelp() {
   Serial.println("  CFG         read back the CS1237 config register (expect 0x7C)");
   Serial.printf("  TARE        average the next %d samples as zero\n", TARE_SAMPLES);
   Serial.printf("  DUMP,<n>    print the next n raw samples (1..%d) as idx,dt_us,raw,hex\n", DUMP_MAX_SAMPLES);
-  Serial.println("  CLR         clear sketch-side maxima (burst, loop gap, bad-read count)");
+  Serial.println("  CLR         clear sketch-side maxima and counts (burst, loop gap, bad reads, spikes)");
   Serial.println("  OFF         release the power latch (same as holding the button)");
 }
 
@@ -602,6 +640,8 @@ static void processCommand(const char *cmd) {
     lifetimeBad = 0;
     orderErrors = 0;
     spikes = 0;
+    spikesBitLike = 0;
+    spikesAllOnes = 0;
     Serial.println("OK:CLR (driver counters drop/recfg/maxgap are lifetime and stay)");
   } else if (strcmp(cmd, "OFF") == 0) {
     Serial.println("OK:OFF");
